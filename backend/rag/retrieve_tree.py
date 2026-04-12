@@ -44,14 +44,19 @@ _STOPWORDS = {
     "a",
     "an",
     "and",
+    "can",
     "are",
     "as",
     "at",
     "be",
+    "could",
     "by",
     "for",
     "from",
     "how",
+    "did",
+    "do",
+    "does",
     "i",
     "in",
     "is",
@@ -60,9 +65,11 @@ _STOPWORDS = {
     "of",
     "on",
     "or",
+    "should",
     "the",
     "to",
     "what",
+    "would",
     "when",
     "where",
     "why",
@@ -204,6 +211,9 @@ def _score_node(query_text: str, keywords: Sequence[str], phrases: Sequence[str]
     if query_text in question:
         score += 8
 
+    if score <= 0:
+        return 0
+
     stack_score = node.get("score")
     if isinstance(stack_score, (int, float)):
         score += min(int(stack_score // 25), 2)
@@ -245,10 +255,11 @@ def retrieve_tree(query: str) -> List[Dict[str, object]]:
 
     ranked: List[Tuple[int, str, Dict[str, object]]] = []
     seen: set[Tuple[str, str]] = set()
+    minimum_score = 8 if topic == DEFAULT_TOPIC else 1
     for branch in candidate_subtopics:
         for node in topic_bucket.get(branch, []):
             score = _score_node(normalized_query, keywords, phrases, node)
-            if score <= 0:
+            if score < minimum_score:
                 continue
             question = str(node.get("question") or "")
             answer = str(node.get("answer") or "")

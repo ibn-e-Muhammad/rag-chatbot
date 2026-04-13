@@ -12,6 +12,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 MAX_TOTAL_RESULTS = 6
 TREE_STRONG_THRESHOLD = 3
+MAX_CONTEXT_ANSWER_CHARS = 420
 
 _TECHNICAL_HINTS = {
     "api",
@@ -85,6 +86,8 @@ def _format_item(item: Mapping[str, object]) -> str:
     answer = _normalize_text(str(item.get("answer") or ""))
     if not question and not answer:
         return ""
+    if len(answer) > MAX_CONTEXT_ANSWER_CHARS:
+        answer = answer[:MAX_CONTEXT_ANSWER_CHARS].rstrip() + "..."
     label = _source_label(item)
     return f"Source: [{label}]\nQuestion: {question}\nAnswer: {answer}\n"
 

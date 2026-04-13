@@ -23,6 +23,31 @@ def test_query(query):
     context = retrieve(query)
     print(context if context else "No context retrieved.")
 
+
+def test_source_labels_present_when_context_exists():
+    context = retrieve("How do I use for loops in Python?")
+    if not context:
+        pytest.skip("No context returned")
+    assert "Source: [Glaive]" in context or "Source: [StackOverflow]" in context
+
+
+def test_no_exact_duplicate_blocks():
+    context = retrieve("How do I use for loops in Python?")
+    if not context:
+        pytest.skip("No context returned")
+    blocks = [block.strip() for block in context.split("\n\n") if block.strip()]
+    assert len(blocks) == len(set(blocks))
+
+
+def test_context_formatting_pattern():
+    context = retrieve("FastAPI middleware for custom headers")
+    if not context:
+        pytest.skip("No context returned")
+    for block in [b for b in context.split("\n\n") if b.strip()]:
+        assert "Source: [" in block
+        assert "Question:" in block
+        assert "Answer:" in block
+
 if __name__ == "__main__":
     for query in QUERIES:
         test_query(query)

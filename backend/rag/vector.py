@@ -46,6 +46,19 @@ def _vectorstore_path() -> Path:
     return _repo_root() / "vectorstore" / "chroma"
 
 
+@lru_cache(maxsize=1)
+def _load_local_env() -> None:
+    """Load local .env in dev without overriding real host environment vars."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        return
+
+    repo_env = _repo_root() / ".env"
+    if repo_env.exists():
+        load_dotenv(dotenv_path=repo_env, override=False)
+
+
 try:
     import orjson  # type: ignore
 
@@ -154,6 +167,7 @@ def _build_chunk_id(source: str, record: Mapping[str, object], chunk_index: int,
 
 
 def _resolve_api_key() -> str:
+    _load_local_env()
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing Gemini API key. Set GOOGLE_API_KEY or GEMINI_API_KEY.")

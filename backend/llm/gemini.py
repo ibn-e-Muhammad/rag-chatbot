@@ -2,19 +2,42 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import List
+from pathlib import Path
+from typing import Dict, List, Literal
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
 FALLBACK_MESSAGE = "I don't have enough information to answer that."
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
+MAX_CONTEXT_BLOCKS = 3
+MAX_ANSWER_CHARS_PER_BLOCK = 320
+MIN_QUERY_CONTEXT_OVERLAP = 2
+
+LOGGER = logging.getLogger(__name__)
+
+ResponseMode = Literal["online", "offline_fallback", "hard_fail"]
 
 
 def _normalize_text(value: str) -> str:
     return _WHITESPACE_RE.sub(" ", value).strip()
+
+
+@lru_cache(maxsize=1)
+def _load_local_env() -> None:
+    """Load local .env in dev without overriding real host environment vars."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        return
+
+    repo_env = Path(__file__).resolve().parents[2] / ".env"
+    if repo_env.exists():
+        load_dotenv(dotenv_path=repo_env, override=False)
 
 
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9+#._-]*")
@@ -69,8 +92,22 @@ def _context_is_empty(context: str) -> bool:
     return not re.search(r"\w", scrubbed)
 
 
+def _response_policy() -> ResponseMode:
+    raw = _normalize_text(os.getenv("RAG_LLM_RESPONSE_POLICY") or "graceful").lower()
+    if raw in {"strict", "hard_fail", "hard-fail"}:
+        return "hard_fail"
+    return "offline_fallback"
+
+
 def _tokenize(value: str) -> set[str]:
-    return {token for token in _WORD_RE.findall(_normalize_text(value).lower()) if token not in _STOPWORDS}
+    tokens = []
+    for token in _WORD_RE.findall(_normalize_text(value).lower()):
+        if token in _STOPWORDS:
+            continue
+        if len(token) > 4 and token.endswith("s"):
+            token = token[:-1]
+        tokens.append(token)
+    return set(tokens)
 
 
 def _parse_context_blocks(context: str) -> List[dict[str, str]]:
@@ -92,6 +129,35 @@ def _parse_context_blocks(context: str) -> List[dict[str, str]]:
             }
         )
     return blocks
+
+
+def _compress_context_for_prompt(query: str, context: str) -> str:
+    blocks = _parse_context_blocks(context)
+    if not blocks:
+        return _normalize_text(context)
+
+    query_tokens = _tokenize(query)
+
+    def rank(block: Dict[str, str]) -> tuple[int, int, int]:
+        source = block.get("source", "")
+        source_bonus = 2 if source.lower().startswith("glaive") else 1 if source.lower().startswith("stack") else 0
+        text = f"{block.get('question', '')} {block.get('answer', '')}"
+        overlap = len(query_tokens & _tokenize(text))
+        return (overlap, source_bonus, len(block.get("answer", "")))
+
+    top_blocks = sorted(blocks, key=rank, reverse=True)[:MAX_CONTEXT_BLOCKS]
+    compact_lines: List[str] = []
+    for idx, block in enumerate(top_blocks, start=1):
+        source = block.get("source", "Unknown") or "Unknown"
+        question = _normalize_text(block.get("question", ""))
+        answer = _normalize_text(block.get("answer", ""))
+        answer = answer[:MAX_ANSWER_CHARS_PER_BLOCK]
+        compact_lines.append(
+            f"Evidence {idx} [{source}]\n"
+            f"Q: {question}\n"
+            f"A: {answer}"
+        )
+    return "\n\n".join(compact_lines)
 
 
 def _context_query_overlap(query: str, context: str) -> int:
@@ -138,7 +204,7 @@ def _extract_example(answer: str) -> str:
 
 
 def _offline_response(query: str, context: str) -> str:
-    if _context_query_overlap(query, context) == 0:
+    if _context_query_overlap(query, context) < MIN_QUERY_CONTEXT_OVERLAP:
         return FALLBACK_MESSAGE
 
     block = _choose_context_block(query, context)
@@ -146,7 +212,6 @@ def _offline_response(query: str, context: str) -> str:
         return FALLBACK_MESSAGE
 
     source = block.get("source", "").strip() or "Unknown"
-    question = block.get("question", "").strip() or query
     answer = block.get("answer", "").strip()
     if not answer:
         return FALLBACK_MESSAGE
@@ -160,19 +225,45 @@ def _offline_response(query: str, context: str) -> str:
     example = _extract_example(answer)
 
     return (
-        f"Source: [{source}]\n"
-        f"Question: {question}\n"
-        f"Answer:\n"
         f"Short definition: {short_definition}\n"
         f"Simple explanation: {simple_explanation}\n"
-        f"Example: {example}"
+        f"Example: {example}\n"
+        f"Sources: [{source}]"
     )
 
 
+def _is_context_dump(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return True
+    markers = ["Source:", "Question:", "Answer:"]
+    marker_hits = sum(normalized.count(marker) for marker in markers)
+    return marker_hits >= 3
+
+
+def _validate_generated_response(query: str, context: str, response: str) -> str:
+    normalized = _normalize_text(response)
+    if not normalized:
+        return ""
+    if normalized == FALLBACK_MESSAGE:
+        return FALLBACK_MESSAGE
+    if _context_query_overlap(query, context) < MIN_QUERY_CONTEXT_OVERLAP:
+        return FALLBACK_MESSAGE
+    normalized_lower = normalized.lower()
+    required_sections = ("short definition:", "simple explanation:", "example:", "sources:")
+    if not all(section in normalized_lower for section in required_sections):
+        return ""
+    if _is_context_dump(normalized):
+        return ""
+    return response.strip()
+
+
 def _resolve_api_key() -> str:
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    _load_local_env()
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing Gemini API key. Set GOOGLE_API_KEY or GEMINI_API_KEY.")
+    os.environ["GEMINI_API_KEY"] = api_key
     return api_key
 
 
@@ -181,17 +272,92 @@ class _GeminiClient:
         self._api_key = api_key
         self._model = model
         self._client = self._build_client()
+        self._resolved_model: str | None = None
 
     def _build_client(self):
         try:
             from google import genai  # type: ignore
 
-            return genai.Client(api_key=self._api_key)
+            return genai.Client()
         except ImportError as exc:
             raise RuntimeError("Missing google-genai library. Install it using 'pip install google-genai'.") from exc
 
+    def list_models(self) -> List[object]:
+        try:
+            return list(self._client.models.list())
+        except Exception as exc:
+            LOGGER.warning("Unable to list Gemini models: %s", exc)
+            return []
+
+    @staticmethod
+    def _normalize_model_name(model_name: str) -> str:
+        if model_name.startswith("models/"):
+            return model_name.split("/", 1)[1]
+        return model_name
+
+    def _resolve_generation_model(self) -> str:
+        if self._resolved_model:
+            return self._resolved_model
+
+        configured = self._model
+        configured_normalized = self._normalize_model_name(configured)
+        listed_models = self.list_models()
+
+        generation_models: List[str] = []
+        for model in listed_models:
+            name = str(getattr(model, "name", "") or "")
+            actions = getattr(model, "supported_actions", None) or []
+            if name and "generateContent" in actions:
+                generation_models.append(name)
+
+        resolved = configured
+        if generation_models:
+            configured_candidates = {configured, configured_normalized, f"models/{configured_normalized}"}
+            configured_normalized_candidates = {
+                self._normalize_model_name(candidate) for candidate in configured_candidates
+            }
+            exact_match = next(
+                (
+                    name
+                    for name in generation_models
+                    if self._normalize_model_name(name) in configured_normalized_candidates
+                ),
+                None,
+            )
+            if exact_match:
+                resolved = exact_match
+            else:
+                preferred_order = [
+                    "models/gemini-2.5-flash",
+                    "models/gemini-2.0-flash",
+                    "models/gemini-1.5-flash-latest",
+                    "models/gemini-1.5-flash",
+                    "gemini-2.5-flash",
+                    "gemini-2.0-flash",
+                    "gemini-1.5-flash-latest",
+                    "gemini-1.5-flash",
+                ]
+                preferred_match = next(
+                    (
+                        name
+                        for preferred in preferred_order
+                        for name in generation_models
+                        if self._normalize_model_name(name) == self._normalize_model_name(preferred)
+                    ),
+                    None,
+                )
+                resolved = preferred_match or generation_models[0]
+
+        self._resolved_model = resolved
+        if self._normalize_model_name(resolved) != configured_normalized:
+            LOGGER.info("Using Gemini generation model '%s' instead of '%s'.", resolved, configured)
+        return resolved
+
     def generate(self, prompt: str) -> str:
-        response = self._client.models.generate_content(model=self._model, contents=prompt)
+        try:
+            response = self._client.models.generate_content(model="gemini-2.5-flash-lite", contents=prompt)
+        except Exception as exc:
+            raise RuntimeError(f"API Error: {exc}") from exc
         text = getattr(response, "text", None)
         if isinstance(text, str) and text.strip():
             return text.strip()
@@ -220,36 +386,54 @@ def _build_prompt(query: str, context: str) -> str:
         "Answer ONLY from the provided context.",
         f"If the answer is not present, say: '{FALLBACK_MESSAGE}'.",
         "Do NOT use external knowledge or guess.",
-        "Include source labels like [Glaive] or [StackOverflow] when citing facts.",
+        "Do NOT copy the raw context format (no repeating 'Source:', 'Question:', 'Answer:' blocks).",
         "Follow this structure:",
         "1. Short definition",
         "2. Simple explanation",
         "3. Example (if applicable)",
+        "4. Sources: [Label1], [Label2]",
+        "Keep answer concise (max 120 words).",
         "Use friendly, clear, educational language and avoid unnecessary jargon.",
         "Prefer Glaive context over StackOverflow when both are present.",
     ]
+    compact_context = _compress_context_for_prompt(query, context)
     return (
         "Instructions:\n"
         + "\n".join(instructions)
         + "\n\nContext:\n"
-        + context
+        + compact_context
         + "\n\nUser query:\n"
         + query
     )
 
 
-def generate_response(query: str, context: str) -> str:
-    """Generate a response using Gemini grounded in retrieved context."""
+@dataclass(frozen=True)
+class GenerationMeta:
+    mode: ResponseMode
+    reason: str
+
+
+def generate_response_with_meta(query: str, context: str) -> tuple[str, GenerationMeta]:
     normalized_query = _normalize_text(query)
     if not normalized_query or _context_is_empty(context):
-        return FALLBACK_MESSAGE
+        return FALLBACK_MESSAGE, GenerationMeta(mode="offline_fallback", reason="empty_query_or_context")
 
-    try:
-        prompt = _build_prompt(normalized_query, context)
-        response = _get_client().generate(prompt)
-        if response:
-            return response
-    except Exception:
-        pass
+    policy = _response_policy()
+    prompt = _build_prompt(normalized_query, context)
+    response = _get_client().generate(prompt)
+    validated = _validate_generated_response(normalized_query, context, response)
+    if validated:
+        return validated, GenerationMeta(mode="online", reason="ok")
+    LOGGER.warning("Discarded model response due to validation failure; using offline fallback.")
+    if policy == "hard_fail":
+        raise RuntimeError("Model response validation failed.")
+    return _offline_response(normalized_query, context), GenerationMeta(
+        mode="offline_fallback",
+        reason="invalid_or_context_dumped_output",
+    )
 
-    return _offline_response(normalized_query, context)
+
+def generate_response(query: str, context: str) -> str:
+    """Generate a response using Gemini grounded in retrieved context."""
+    response, _meta = generate_response_with_meta(query, context)
+    return response

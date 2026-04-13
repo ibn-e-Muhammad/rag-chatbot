@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from llm.gemini import generate_response
+from llm.gemini import generate_response_with_meta
 from rag.retrieve import retrieve
 
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +32,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: List[str]
+    mode: str | None = None
+    reason: str | None = None
 
 
 def _extract_sources(context: str) -> List[str]:
@@ -52,11 +54,11 @@ def chat(request: ChatRequest) -> ChatResponse:
     start_time = time.perf_counter()
     try:
         context = retrieve(request.query)
-        answer = generate_response(request.query, context)
+        answer, meta = generate_response_with_meta(request.query, context)
         sources = _extract_sources(context)
         duration = time.perf_counter() - start_time
-        logger.info("Generated response in %.2fs", duration)
-        return ChatResponse(answer=answer, sources=sources)
-    except Exception:
+        logger.info("Generated response in %.2fs (mode=%s reason=%s)", duration, meta.mode, meta.reason)
+        return ChatResponse(answer=answer, sources=sources, mode=meta.mode, reason=meta.reason)
+    except Exception as exc:
         logger.exception("Failed to generate response")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")

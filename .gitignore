@@ -24,6 +24,9 @@ env/
 data/
 vectorstore/
 backend/rag/__pycache__/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
 
 # OS
 Thumbs.db

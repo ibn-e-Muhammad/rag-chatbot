@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Dict, List, Literal
 _WHITESPACE_RE = re.compile(r"\s+")
 
 FALLBACK_MESSAGE = "I don't have enough information to answer that."
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"  # Can be overridden by setting the GEMINI_MODEL environment variable
 MAX_CONTEXT_BLOCKS = 3
 MAX_ANSWER_CHARS_PER_BLOCK = 320
 MIN_QUERY_CONTEXT_OVERLAP = 2
@@ -238,7 +239,7 @@ def _is_context_dump(text: str) -> bool:
         return True
     markers = ["Source:", "Question:", "Answer:"]
     marker_hits = sum(normalized.count(marker) for marker in markers)
-    return marker_hits >= 3
+    return marker_hits >= 6
 
 
 def _validate_generated_response(query: str, context: str, response: str) -> str:
@@ -249,10 +250,6 @@ def _validate_generated_response(query: str, context: str, response: str) -> str
         return FALLBACK_MESSAGE
     if _context_query_overlap(query, context) < MIN_QUERY_CONTEXT_OVERLAP:
         return FALLBACK_MESSAGE
-    normalized_lower = normalized.lower()
-    required_sections = ("short definition:", "simple explanation:", "example:", "sources:")
-    if not all(section in normalized_lower for section in required_sections):
-        return ""
     if _is_context_dump(normalized):
         return ""
     return response.strip()
@@ -272,106 +269,48 @@ class _GeminiClient:
         self._api_key = api_key
         self._model = model
         self._client = self._build_client()
-        self._resolved_model: str | None = None
 
     def _build_client(self):
         try:
             from google import genai  # type: ignore
 
-            return genai.Client()
+            return genai.Client(api_key=self._api_key)
         except ImportError as exc:
             raise RuntimeError("Missing google-genai library. Install it using 'pip install google-genai'.") from exc
 
-    def list_models(self) -> List[object]:
-        try:
-            return list(self._client.models.list())
-        except Exception as exc:
-            LOGGER.warning("Unable to list Gemini models: %s", exc)
-            return []
-
-    @staticmethod
-    def _normalize_model_name(model_name: str) -> str:
-        if model_name.startswith("models/"):
-            return model_name.split("/", 1)[1]
-        return model_name
-
-    def _resolve_generation_model(self) -> str:
-        if self._resolved_model:
-            return self._resolved_model
-
-        configured = self._model
-        configured_normalized = self._normalize_model_name(configured)
-        listed_models = self.list_models()
-
-        generation_models: List[str] = []
-        for model in listed_models:
-            name = str(getattr(model, "name", "") or "")
-            actions = getattr(model, "supported_actions", None) or []
-            if name and "generateContent" in actions:
-                generation_models.append(name)
-
-        resolved = configured
-        if generation_models:
-            configured_candidates = {configured, configured_normalized, f"models/{configured_normalized}"}
-            configured_normalized_candidates = {
-                self._normalize_model_name(candidate) for candidate in configured_candidates
-            }
-            exact_match = next(
-                (
-                    name
-                    for name in generation_models
-                    if self._normalize_model_name(name) in configured_normalized_candidates
-                ),
-                None,
-            )
-            if exact_match:
-                resolved = exact_match
-            else:
-                preferred_order = [
-                    "models/gemini-2.5-flash",
-                    "models/gemini-2.0-flash",
-                    "models/gemini-1.5-flash-latest",
-                    "models/gemini-1.5-flash",
-                    "gemini-2.5-flash",
-                    "gemini-2.0-flash",
-                    "gemini-1.5-flash-latest",
-                    "gemini-1.5-flash",
-                ]
-                preferred_match = next(
-                    (
-                        name
-                        for preferred in preferred_order
-                        for name in generation_models
-                        if self._normalize_model_name(name) == self._normalize_model_name(preferred)
-                    ),
-                    None,
-                )
-                resolved = preferred_match or generation_models[0]
-
-        self._resolved_model = resolved
-        if self._normalize_model_name(resolved) != configured_normalized:
-            LOGGER.info("Using Gemini generation model '%s' instead of '%s'.", resolved, configured)
-        return resolved
+    _MAX_RETRIES = 2
+    _RETRY_BASE_DELAY = 2  # seconds
 
     def generate(self, prompt: str) -> str:
-        try:
-            response = self._client.models.generate_content(model="gemini-2.5-flash-lite", contents=prompt)
-        except Exception as exc:
-            raise RuntimeError(f"API Error: {exc}") from exc
-        text = getattr(response, "text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-        candidates = getattr(response, "candidates", None) or []
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None) if content else None
-            if not parts:
-                continue
-            chunk = parts[0]
-            part_text = getattr(chunk, "text", None)
-            if isinstance(part_text, str) and part_text.strip():
-                return part_text.strip()
-        return ""
+        last_exc: Exception | None = None
+        for attempt in range(1 + self._MAX_RETRIES):
+            try:
+                response = self._client.models.generate_content(model=self._model, contents=prompt)
+                text = getattr(response, "text", None)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+                candidates = getattr(response, "candidates", None) or []
+                for candidate in candidates:
+                    content = getattr(candidate, "content", None)
+                    parts = getattr(content, "parts", None) if content else None
+                    if not parts:
+                        continue
+                    chunk = parts[0]
+                    part_text = getattr(chunk, "text", None)
+                    if isinstance(part_text, str) and part_text.strip():
+                        return part_text.strip()
+                return ""
+            except Exception as exc:
+                error_text = str(exc).upper()
+                is_transient = "503" in error_text or "UNAVAILABLE" in error_text or "OVERLOADED" in error_text
+                if is_transient and attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** attempt)
+                    LOGGER.warning("Transient error (attempt %s/%s), retrying in %ss: %s", attempt + 1, 1 + self._MAX_RETRIES, delay, exc)
+                    time.sleep(delay)
+                    last_exc = exc
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
 
 
 @lru_cache(maxsize=1)
@@ -437,3 +376,42 @@ def generate_response(query: str, context: str) -> str:
     """Generate a response using Gemini grounded in retrieved context."""
     response, _meta = generate_response_with_meta(query, context)
     return response
+
+
+def _build_direct_prompt(query: str) -> str:
+    """Build a prompt for direct (non-RAG) generation."""
+    instructions = [
+        "You are a helpful and knowledgeable Python tutor.",
+        "Answer the user's question directly using your own knowledge.",
+        "Follow this structure:",
+        "1. Short definition",
+        "2. Simple explanation",
+        "3. Example (if applicable)",
+        "Keep answer concise (max 150 words).",
+        "Use friendly, clear, educational language and avoid unnecessary jargon.",
+    ]
+    return (
+        "Instructions:\n"
+        + "\n".join(instructions)
+        + "\n\nUser query:\n"
+        + query
+    )
+
+
+def generate_direct_response(query: str) -> str:
+    """Generate a response using Gemini without any RAG context.
+
+    Returns an empty string on failure so the caller can gracefully
+    fall back to showing only the RAG answer.
+    """
+    normalized_query = _normalize_text(query)
+    if not normalized_query:
+        return ""
+    try:
+        prompt = _build_direct_prompt(normalized_query)
+        response = _get_client().generate(prompt)
+        text = _normalize_text(response)
+        return text if text else ""
+    except Exception:
+        LOGGER.warning("Direct (non-RAG) generation failed; returning empty.", exc_info=True)
+        return ""
